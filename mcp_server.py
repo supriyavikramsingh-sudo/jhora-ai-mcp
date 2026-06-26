@@ -1,19 +1,6 @@
 #!/usr/bin/env python3
 """
 JHora MCP server — stdio JSON-RPC 2.0 (Model Context Protocol)
-
-Usage:
-  python3 scripts/mcp_server.py
-
-Add to Claude Desktop config (~/.claude/claude_desktop_config.json):
-  {
-    "mcpServers": {
-      "jhora": {
-        "command": "python3",
-        "args": ["/absolute/path/to/scripts/mcp_server.py"]
-      }
-    }
-  }
 """
 
 import json, os, re, subprocess, sys
@@ -21,8 +8,6 @@ import json, os, re, subprocess, sys
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 EXTRACT_SH  = os.path.join(SCRIPTS_DIR, 'jhora_extract.sh')
 OUT_DIR     = os.path.join(SCRIPTS_DIR, 'jhora_data')
-
-# ── Data helpers ──────────────────────────────────────────────────────────────
 
 def _latest_run_dir(name):
     safe     = re.sub(r'[^\w\-]', '_', name)
@@ -59,48 +44,87 @@ def _run_extraction(params):
     missing  = [k for k in required if not str(params.get(k,'')).strip()]
     if missing:
         return None, f'Missing fields: {", ".join(missing)}'
-    cmd = ['bash', EXTRACT_SH,
-           '--name',  str(params['name']).strip(),
-           '--date',  str(params['date']).strip(),
-           '--time',  str(params['time']).strip(),
-           '--lat',   str(params['lat']).strip(),
-           '--lon',   str(params['lon']).strip(),
-           '--tz',    str(params['tz']).strip(),
-           '--place', str(params.get('place','Unknown')).strip()]
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if r.returncode != 0:
-            return None, r.stderr.strip() or 'Extraction failed'
-    except subprocess.TimeoutExpired:
-        return None, 'Extraction timed out (120s)'
-    run_dir = _latest_run_dir(str(params['name']).strip())
-    return (run_dir, None) if run_dir else (None, 'Output not found after extraction')
+    cmd = [EXTRACT_SH,
+           '--name',  str(params['name']),
+           '--date',  str(params['date']),
+           '--time',  str(params['time']),
+           '--lat',   str(params['lat']),
+           '--lon',   str(params['lon']),
+           '--tz',    str(params['tz'])]
+    if params.get('place'):
+        cmd += ['--place', str(params['place'])]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        return None, result.stderr
+    safe    = re.sub(r'[^\w\-]', '_', str(params['name']))
+    run_dir = _latest_run_dir(safe) or _latest_run_dir(str(params['name']))
+    return run_dir, None
 
-
-# ── Tool definitions ──────────────────────────────────────────────────────────
+def _build_summary(data, include_divisionals=True):
+    lines = []
+    meta  = data.get('meta', {})
+    birth = data.get('birth', {})
+    lines.append(f"=== VEDIC ASTROLOGY CHART: {meta.get('name','Unknown')} ===")
+    lines.append(f"Extracted: {meta.get('extracted_at','')}\n")
+    lines.append("── BIRTH DETAILS ──")
+    for k,v in birth.items():
+        lines.append(f"  {k:<20} {v}")
+    panchang = data.get('panchang', {})
+    if panchang:
+        lines.append("\n── PANCHANG ──")
+        for k,v in panchang.items():
+            if isinstance(v, dict):
+                parts = [f"{sk}: {sv}" for sk,sv in v.items()]
+                lines.append(f"  {k:<20} {', '.join(parts)}")
+            else:
+                lines.append(f"  {k:<20} {v}")
+    planets = data.get('planets', {})
+    if planets:
+        lines.append("\n── PLANETARY POSITIONS ──")
+        for p,v in planets.items():
+            if isinstance(v, dict):
+                sign = v.get('sign','')
+                deg  = v.get('sign_degree','')
+                nak  = v.get('nakshatra','')
+                nl   = v.get('nakshatra_lord','')
+                lines.append(f"  {p:<15} {sign} {deg}, nakshatra {nak} (lord: {nl})")
+            else:
+                lines.append(f"  {p:<15} {v}")
+    karakas = data.get('karakas', {})
+    if karakas:
+        lines.append("\n── KARAKAS ──")
+        for k,v in karakas.items():
+            lines.append(f"  {k:<25} {v}")
+    dasha = data.get('dasha', {})
+    if dasha:
+        lines.append("\n── VIMSHOTTARI DASHA ──")
+        for md, mv in list(dasha.items())[:3]:
+            lines.append(f"  {md} ({mv.get('start','')}–{mv.get('end','')})")
+            for ad, av in list(mv.get('antardashas', {}).items())[:5]:
+                lines.append(f"    └─ {ad} ({av.get('start','')}–{av.get('end','')})")
+    if include_divisionals:
+        divs = data.get('divisionals', {})
+        for chart_key in ['D9 (Navamsa)', 'D10 (Dasamsa)']:
+            if chart_key in divs:
+                lines.append(f"\n── {chart_key} POSITIONS ──")
+                for p,v in list(divs[chart_key].items())[:12]:
+                    if isinstance(v, dict):
+                        lines.append(f"  {p:<15} {v.get('sign','')} {v.get('degree','')}")
+    return '\n'.join(lines)
 
 TOOLS = [
     {
         'name': 'list_charts',
-        'description': 'List all previously extracted Vedic astrology charts.',
-        'inputSchema': {
-            'type': 'object',
-            'properties': {},
-            'required': []
-        }
+        'description': 'List all extracted Vedic astrology charts with metadata.',
+        'inputSchema': {'type': 'object', 'properties': {}, 'required': []}
     },
     {
         'name': 'get_chart',
-        'description': (
-            'Get full chart data for a person by name. '
-            'Returns planets, divisionals, panchang, ashtakavarga, dasha, karakas. '
-            'format: "core" (15 bodies, default), "dev" (all bodies, abbr), '
-            '"llm" (fully expanded + ASCII charts), "raw" (raw parsed output).'
-        ),
+        'description': 'Get full chart data for a person. Format: core/dev/llm/raw.',
         'inputSchema': {
             'type': 'object',
             'properties': {
-                'name': {'type': 'string', 'description': 'Person name (must match extracted chart)'},
+                'name':   {'type': 'string'},
                 'format': {'type': 'string', 'enum': ['core','dev','llm','raw'], 'default': 'core'}
             },
             'required': ['name']
@@ -108,11 +132,11 @@ TOOLS = [
     },
     {
         'name': 'get_planets',
-        'description': 'Get planetary positions for a chart — sign, degree, house, nakshatra, retrograde, combust.',
+        'description': 'Get planetary positions only — sign, degree, nakshatra, house.',
         'inputSchema': {
             'type': 'object',
             'properties': {
-                'name':   {'type': 'string', 'description': 'Person name'},
+                'name':   {'type': 'string'},
                 'format': {'type': 'string', 'enum': ['core','dev','llm','raw'], 'default': 'core'}
             },
             'required': ['name']
@@ -120,15 +144,12 @@ TOOLS = [
     },
     {
         'name': 'get_divisional',
-        'description': (
-            'Get planetary positions in a specific divisional chart (e.g. D9, D10, D1). '
-            'Returns all bodies in that chart with sign, degree, longitude.'
-        ),
+        'description': 'Get a single divisional chart (D9, D10, D1 etc).',
         'inputSchema': {
             'type': 'object',
             'properties': {
-                'name':  {'type': 'string', 'description': 'Person name'},
-                'chart': {'type': 'string', 'description': 'Chart key, e.g. "D9", "D10", "D1"'},
+                'name':   {'type': 'string'},
+                'chart':  {'type': 'string', 'description': 'e.g. D9, D10, D1'},
                 'format': {'type': 'string', 'enum': ['core','dev','llm','raw'], 'default': 'core'}
             },
             'required': ['name', 'chart']
@@ -136,233 +157,158 @@ TOOLS = [
     },
     {
         'name': 'get_panchang',
-        'description': 'Get Panchang details for a chart — tithi, vara, nakshatra, yoga, karana, sunrise, kalam timings.',
+        'description': 'Get panchang for a chart — tithi, vara, nakshatra, yoga, karana, kalam.',
         'inputSchema': {
             'type': 'object',
-            'properties': {
-                'name': {'type': 'string', 'description': 'Person name'}
-            },
+            'properties': {'name': {'type': 'string'}},
             'required': ['name']
         }
     },
     {
         'name': 'get_dasha',
-        'description': 'Get Vimshottari Dasha periods (3-level: mahadasha → antardasha → pratyantardasha) for a chart.',
+        'description': 'Get Vimshottari Dasha (3 levels) for a chart.',
         'inputSchema': {
             'type': 'object',
-            'properties': {
-                'name': {'type': 'string', 'description': 'Person name'}
-            },
+            'properties': {'name': {'type': 'string'}},
             'required': ['name']
         }
     },
     {
         'name': 'summarize_chart',
-        'description': (
-            'Get a plain-text LLM-friendly summary of a Vedic astrology chart. '
-            'Returns structured prose covering birth details, lagna, planets, '
-            'current dasha, panchang, and key divisionals — no JSON parsing needed. '
-            'Ideal for asking follow-up questions or generating interpretations.'
-        ),
+        'description': 'Plain-text LLM-friendly summary of a Vedic astrology chart.',
         'inputSchema': {
             'type': 'object',
             'properties': {
-                'name': {'type': 'string', 'description': 'Person name'},
-                'include_divisionals': {
-                    'type': 'boolean',
-                    'description': 'Include D9/D10 divisional placements (default true)',
-                    'default': True
-                }
+                'name': {'type': 'string'},
+                'include_divisionals': {'type': 'boolean', 'default': True}
             },
             'required': ['name']
         }
     },
     {
         'name': 'extract_chart',
+        'description': 'Extract a new chart by running JHora (~60s). Requires Wine + JHora.',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'name':  {'type': 'string'},
+                'date':  {'type': 'string', 'description': 'YYYY-MM-DD'},
+                'time':  {'type': 'string', 'description': 'HH:MM'},
+                'lat':   {'type': 'number'},
+                'lon':   {'type': 'number'},
+                'tz':    {'type': 'number', 'description': 'decimal hours east, e.g. 5.5 for IST'},
+                'place': {'type': 'string'}
+            },
+            'required': ['name','date','time','lat','lon','tz']
+        }
+    },
+    {
+        'name': 'get_best_slots',
         'description': (
-            'Extract a new Vedic astrology chart by running JHora. '
-            'Requires JHora installed via Wine. Takes ~30 seconds. '
-            'Returns the extracted chart data in core format.'
+            'Find the best interview slots in a date range using interview_slots.py. '
+            'Scores each 45-min slot by Tara Bala (natal nakshatra), classical panchanga '
+            '(Vara, Tithi, Yoga, Karana), 7th house analysis for virtual/onsite mode, '
+            'and PM 14.86-88 dasha lord trigger. Returns ranked slots with full reasoning.'
         ),
         'inputSchema': {
             'type': 'object',
             'properties': {
-                'name':  {'type': 'string', 'description': 'Person name'},
-                'date':  {'type': 'string', 'description': 'Birth date YYYY-MM-DD'},
-                'time':  {'type': 'string', 'description': 'Birth time HH:MM'},
-                'lat':   {'type': 'number', 'description': 'Latitude (positive=north)'},
-                'lon':   {'type': 'number', 'description': 'Longitude (positive=east)'},
-                'tz':    {'type': 'number', 'description': 'Timezone offset in hours (e.g. 5.5 for IST)'},
-                'place': {'type': 'string', 'description': 'Place name (optional, for reference)'}
+                'natal':   {'type': 'string', 'description': 'Extracted chart name for natal nakshatra lookup'},
+                'start':   {'type': 'string', 'description': 'Start date YYYY-MM-DD'},
+                'end':     {'type': 'string', 'description': 'End date YYYY-MM-DD'},
+                'lat':     {'type': 'number', 'description': 'Latitude of interview location'},
+                'lon':     {'type': 'number', 'description': 'Longitude of interview location'},
+                'tz':      {'type': 'number', 'description': 'Timezone offset, e.g. 5.5 for IST'},
+                'place':   {'type': 'string', 'description': 'Place name'},
+                'mode':    {'type': 'string', 'enum': ['virtual', 'onsite'], 'default': 'virtual',
+                            'description': 'Interview mode — affects 7th house weighting'},
+                'extract': {'type': 'boolean', 'description': 'Force fresh JHora extraction', 'default': False}
             },
-            'required': ['name','date','time','lat','lon','tz']
+            'required': ['natal','start','end','lat','lon','tz','place']
         }
     }
 ]
 
-
-# ── Text summary ─────────────────────────────────────────────────────────────
-
-def _fmt_planet(name, p):
-    parts = [f"{p.get('sign','')} {p.get('sign_degree','')}"]
-    if p.get('house'): parts.append(f"house {p['house']}")
-    if p.get('nakshatra'): parts.append(f"nakshatra {p['nakshatra']} (lord: {p.get('nakshatra_lord','')})")
-    if p.get('retrograde'): parts.append('retrograde')
-    if p.get('combust'): parts.append('combust')
-    return f"  {name:15s} {', '.join(parts)}"
-
-def _fmt_dasha(dasha):
-    lines = []
-    for maha, mdata in list(dasha.items())[:3]:
-        start = mdata.get('start',''); end = mdata.get('end','')
-        lines.append(f"  {maha} ({start}–{end})")
-        for antar, adata in list(mdata.get('antardashas',{}).items())[:3]:
-            astart = adata.get('start',''); aend = adata.get('end','')
-            lines.append(f"    └─ {antar} ({astart}–{aend})")
-    return '\n'.join(lines)
-
-def _build_summary(data, include_divisionals=True):
-    meta    = data.get('meta', {})
-    birth   = data.get('birth', {})
-    panchang= data.get('panchang', {})
-    planets = data.get('planets', {})
-    karakas = data.get('karakas', {})
-    dasha   = data.get('dasha', {})
-    divs    = data.get('divisionals', {})
-
-    lines = []
-
-    # Header
-    lines.append(f"=== VEDIC ASTROLOGY CHART: {meta.get('name','')} ===")
-    lines.append(f"Extracted: {meta.get('extracted_at','')}")
-    lines.append('')
-
-    # Birth details
-    lines.append('── BIRTH DETAILS ──')
-    for k, v in birth.items():
-        if v: lines.append(f"  {k.replace('_',' ').title():20s} {v}")
-    lines.append('')
-
-    # Panchang
-    lines.append('── PANCHANG ──')
-    for k, v in panchang.items():
-        if isinstance(v, dict):
-            lord = v.get('lord',''); rem = v.get('remaining_pct','')
-            lines.append(f"  {k.replace('_',' ').title():20s} {v.get('name','')} (lord: {lord}, {rem}% left)")
-        else:
-            lines.append(f"  {k.replace('_',' ').title():20s} {v}")
-    lines.append('')
-
-    # Planets
-    lines.append('── PLANETARY POSITIONS (Lagna + 9 Grahas + Upagrahas) ──')
-    for name, p in planets.items():
-        lines.append(_fmt_planet(name, p))
-    lines.append('')
-
-    # Karakas
-    if karakas:
-        lines.append('── KARAKAS ──')
-        for k, v in karakas.items():
-            lines.append(f"  {k:25s} {v}")
-        lines.append('')
-
-    # Dasha
-    if dasha:
-        lines.append('── VIMSHOTTARI DASHA (current + upcoming) ──')
-        lines.append(_fmt_dasha(dasha))
-        lines.append('')
-
-    # Divisionals
-    if include_divisionals:
-        for chart_key in ['D1 (Rasi)','D9 (Navamsa)','D10 (Dasamsa)']:
-            # match flexibly
-            match = next((v for k, v in divs.items() if chart_key.split()[0] in k), None)
-            if not match: match = divs.get(chart_key)
-            if match:
-                lines.append(f'── {chart_key} POSITIONS ──')
-                for body, pos in match.items():
-                    sign = pos.get('sign',''); deg = pos.get('degree','')
-                    lines.append(f"  {body:15s} {sign} {deg}")
-                lines.append('')
-
-    return '\n'.join(lines)
-
-
-# ── Tool dispatch ─────────────────────────────────────────────────────────────
-
 def call_tool(name, args):
     if name == 'list_charts':
         charts = _list_charts()
-        return {'charts': charts, 'count': len(charts)}
+        if not charts: return 'No charts found.'
+        return '\n'.join(
+            f"• {c['name']} — extracted {c['extracted_at']} ({c['runs']} run(s))"
+            for c in charts)
 
     if name == 'get_chart':
-        person  = args.get('name','')
-        fmt     = args.get('format', 'core')
-        run_dir = _latest_run_dir(person)
-        if not run_dir:
-            raise ValueError(f'No chart found for "{person}". Use list_charts to see available charts.')
-        return _load_format(run_dir, fmt)
+        run_dir = _latest_run_dir(args.get('name',''))
+        if not run_dir: raise ValueError(f'No chart found for "{args.get("name")}". Use list_charts.')
+        return _load_format(run_dir, args.get('format','core'))
 
     if name == 'get_planets':
-        person  = args.get('name','')
-        fmt     = args.get('format', 'core')
-        run_dir = _latest_run_dir(person)
-        if not run_dir:
-            raise ValueError(f'No chart found for "{person}".')
-        data = _load_format(run_dir, fmt)
-        return {'name': data.get('meta',{}).get('name'), 'planets': data.get('planets',{})}
+        run_dir = _latest_run_dir(args.get('name',''))
+        if not run_dir: raise ValueError(f'No chart found for "{args.get("name")}". Use list_charts.')
+        data = _load_format(run_dir, args.get('format','core'))
+        return data.get('planets', {})
 
     if name == 'get_divisional':
-        person    = args.get('name','')
-        chart_key = args.get('chart','').upper()
-        fmt       = args.get('format', 'core')
-        run_dir   = _latest_run_dir(person)
-        if not run_dir:
-            raise ValueError(f'No chart found for "{person}".')
-        divs = _load_format(run_dir, fmt).get('divisionals', {})
+        run_dir = _latest_run_dir(args.get('name',''))
+        if not run_dir: raise ValueError(f'No chart found.')
+        data    = _load_format(run_dir, args.get('format','core'))
+        divs    = data.get('divisionals', {})
+        chart_key = args.get('chart','D9')
         match = divs.get(chart_key) or next(
-            (v for k, v in divs.items() if chart_key in k.upper()), None)
-        if not match:
-            available = list(divs.keys())
-            raise ValueError(f'Divisional {chart_key!r} not found. Available: {available}')
+            (v for k,v in divs.items() if chart_key.upper() in k.upper()), None)
+        if not match: raise ValueError(f'Divisional {chart_key!r} not found.')
         return {chart_key: match}
 
     if name == 'get_panchang':
-        person  = args.get('name','')
-        run_dir = _latest_run_dir(person)
-        if not run_dir:
-            raise ValueError(f'No chart found for "{person}".')
+        run_dir = _latest_run_dir(args.get('name',''))
+        if not run_dir: raise ValueError(f'No chart found.')
         data = _load_format(run_dir, 'core')
         return {'name': data.get('meta',{}).get('name'), 'panchang': data.get('panchang',{})}
 
     if name == 'get_dasha':
-        person  = args.get('name','')
-        run_dir = _latest_run_dir(person)
-        if not run_dir:
-            raise ValueError(f'No chart found for "{person}".')
+        run_dir = _latest_run_dir(args.get('name',''))
+        if not run_dir: raise ValueError(f'No chart found.')
         data = _load_format(run_dir, 'core')
         return {'name': data.get('meta',{}).get('name'), 'dasha': data.get('dasha',{})}
 
     if name == 'summarize_chart':
-        person  = args.get('name','')
-        inc_div = args.get('include_divisionals', True)
-        run_dir = _latest_run_dir(person)
-        if not run_dir:
-            raise ValueError(f'No chart found for "{person}". Use list_charts.')
+        run_dir = _latest_run_dir(args.get('name',''))
+        if not run_dir: raise ValueError(f'No chart found.')
         data = _load_format(run_dir, 'core')
-        return _build_summary(data, include_divisionals=inc_div)
+        return _build_summary(data, include_divisionals=args.get('include_divisionals', True))
 
     if name == 'extract_chart':
         params  = {k: str(v) for k, v in args.items()}
         run_dir, err = _run_extraction(params)
-        if err:
-            raise RuntimeError(f'Extraction failed: {err}')
+        if err: raise RuntimeError(f'Extraction failed: {err}')
         return _load_format(run_dir, 'core')
+
+    if name == 'get_best_slots':
+        INTERVIEW_PY = os.path.join(SCRIPTS_DIR, 'interview_slots.py')
+        cmd = [
+            'python3', INTERVIEW_PY,
+            '--natal', str(args['natal']),
+            '--start', str(args['start']),
+            '--end',   str(args['end']),
+            '--lat',   str(args['lat']),
+            '--lon',   str(args['lon']),
+            '--tz',    str(args['tz']),
+            '--place', str(args['place']),
+            '--mode',  str(args.get('mode', 'virtual')),
+        ]
+        if args.get('extract', False):
+            cmd.append('--extract')
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=SCRIPTS_DIR)
+        if result.returncode != 0:
+            raise RuntimeError(f'Slot scoring failed: {result.stderr}')
+        slots_file = os.path.join(SCRIPTS_DIR, 'slot_scores.json')
+        if os.path.exists(slots_file):
+            with open(slots_file) as f:
+                return json.load(f)
+        return result.stdout
 
     raise ValueError(f'Unknown tool: {name}')
 
-
-# ── MCP protocol ──────────────────────────────────────────────────────────────
 
 def send(obj):
     line = json.dumps(obj, ensure_ascii=False)
@@ -378,15 +324,12 @@ def handle(msg):
         send({'jsonrpc':'2.0','id':msg_id,'result':{
             'protocolVersion': '2024-11-05',
             'capabilities': {'tools': {}},
-            'serverInfo': {'name': 'jhora-mcp', 'version': '1.0.0'}
+            'serverInfo': {'name': 'jhora-mcp', 'version': '1.1.0'}
         }})
-
     elif method == 'notifications/initialized':
-        pass  # no response for notifications
-
+        pass
     elif method == 'tools/list':
         send({'jsonrpc':'2.0','id':msg_id,'result':{'tools': TOOLS}})
-
     elif method == 'tools/call':
         tool_name = params.get('name','')
         tool_args = params.get('arguments', {})
@@ -402,12 +345,10 @@ def handle(msg):
                 'content': [{'type':'text','text': str(e)}],
                 'isError': True
             }})
-
     elif msg_id is not None:
         send({'jsonrpc':'2.0','id':msg_id,'error':{
             'code': -32601, 'message': f'Method not found: {method}'
         }})
-
 
 def main():
     for line in sys.stdin:
@@ -418,7 +359,6 @@ def main():
         except json.JSONDecodeError:
             continue
         handle(msg)
-
 
 if __name__ == '__main__':
     main()

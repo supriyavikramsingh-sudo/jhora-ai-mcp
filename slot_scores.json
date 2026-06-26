@@ -1,7 +1,7 @@
 {
   "natal": "Supriya_rect_917",
   "mode": "range",
-  "place": "New Delhi",
+  "place": "Gurugram, India",
   "results": [
     {
       "date": "2026-07-03",
@@ -5855,6 +5855,7 @@
           "Ghati Lagna"
         ],
         "planets_aspecting_7th": [
+          "Hora Lagna",
           "Jupiter (special aspect)"
         ],
         "interviewer_disposition": "formal, scrutinizing, disciplined",
@@ -7256,6 +7257,7 @@
           "Ghati Lagna"
         ],
         "planets_aspecting_7th": [
+          "Hora Lagna",
           "Jupiter (special aspect)"
         ],
         "interviewer_disposition": "formal, scrutinizing, disciplined",
@@ -7386,9 +7388,7 @@
         "seventh_lord_strong": false,
         "seventh_lord_retrograde": false,
         "planets_in_7th": [],
-        "planets_aspecting_7th": [
-          "Hora Lagna"
-        ],
+        "planets_aspecting_7th": [],
         "interviewer_disposition": "direct, competitive, challenging",
         "likely_questions": "technical depth, problem-solving under pressure, past failures"
       }
@@ -7517,9 +7517,7 @@
         "seventh_lord_strong": false,
         "seventh_lord_retrograde": false,
         "planets_in_7th": [],
-        "planets_aspecting_7th": [
-          "Hora Lagna"
-        ],
+        "planets_aspecting_7th": [],
         "interviewer_disposition": "direct, competitive, challenging",
         "likely_questions": "technical depth, problem-solving under pressure, past failures"
       }
@@ -7648,9 +7646,7 @@
         "seventh_lord_strong": false,
         "seventh_lord_retrograde": false,
         "planets_in_7th": [],
-        "planets_aspecting_7th": [
-          "Hora Lagna"
-        ],
+        "planets_aspecting_7th": [],
         "interviewer_disposition": "direct, competitive, challenging",
         "likely_questions": "technical depth, problem-solving under pressure, past failures"
       }

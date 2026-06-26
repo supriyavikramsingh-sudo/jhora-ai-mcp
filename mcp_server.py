@@ -4,6 +4,7 @@ JHora MCP server — stdio JSON-RPC 2.0 (Model Context Protocol)
 """
 
 import json, os, re, subprocess, sys
+from datetime import date as _date, timedelta as _timedelta
 
 SCRIPTS_DIR  = os.path.dirname(os.path.abspath(__file__))
 EXTRACT_SH   = os.path.join(SCRIPTS_DIR, 'jhora_extract.sh')
@@ -324,34 +325,15 @@ def call_tool(name, args):
         return _load_format(run_dir, 'core')
 
     if name == 'interview_advisor':
-        # Step 1: resolve natal chart
-        natal_name  = None
+        # Step 1: resolve natal chart — never extract internally
         natal_chart = str(args.get('natal_chart', '')).strip()
-        if natal_chart and _latest_run_dir(natal_chart):
-            natal_name = natal_chart
-        if natal_name is None:
-            birth_fields = ['birth_name', 'birth_date', 'birth_time', 'birth_lat', 'birth_lon', 'birth_tz']
-            if all(str(args.get(f, '')).strip() for f in birth_fields):
-                params = {
-                    'name':  str(args['birth_name']),
-                    'date':  str(args['birth_date']),
-                    'time':  str(args['birth_time']),
-                    'lat':   str(args['birth_lat']),
-                    'lon':   str(args['birth_lon']),
-                    'tz':    str(args['birth_tz']),
-                    'place': str(args.get('birth_place', '')),
-                }
-                run_dir, err = _run_extraction(params)
-                if err:
-                    raise RuntimeError(f'Birth chart extraction failed: {err}')
-                natal_name = str(args['birth_name'])
-            else:
-                return (
-                    'To score interview slots I need your natal chart. Please provide either:\n'
-                    '  • natal_chart — name of an already-extracted chart (e.g. "Supriya_rect_917"), or\n'
-                    '  • Full birth details: birth_name, birth_date (YYYY-MM-DD), birth_time (HH:MM), '
-                    'birth_lat, birth_lon, birth_tz, and optionally birth_place.'
-                )
+        if not natal_chart:
+            return (
+                'Please provide your natal chart name (e.g. Supriya_rect_917) or your birth details so I can extract it for you.'
+            )
+        if not _latest_run_dir(natal_chart):
+            return f"Chart '{natal_chart}' not found. Please run extract_chart first with your birth details."
+        natal_name = natal_chart
 
         # Step 2: resolve slot mode
         slots      = args.get('slots')
@@ -382,7 +364,23 @@ def call_tool(name, args):
 
         mode = args.get('interview_mode', 'virtual')
 
-        # Step 4: build and run subprocess
+        # Step 4: verify panchanga day charts are pre-extracted (range mode only)
+        if slot_mode == 'range':
+            d      = _date.fromisoformat(start_date)
+            d_end  = _date.fromisoformat(end_date)
+            missing = []
+            while d <= d_end:
+                ds = d.isoformat()
+                if not _latest_run_dir(f'panchanga_{ds}'):
+                    missing.append(ds)
+                d += _timedelta(days=1)
+            if missing:
+                return (
+                    'Missing panchanga charts for: ' + ', '.join(missing) + '.\n'
+                    'Please run extract_chart for each with time 09:00 and the interview location coordinates.'
+                )
+
+        # Step 5: build and run subprocess — never pass --extract
         cmd = [
             'python3', INTERVIEW_PY,
             '--natal', natal_name,
@@ -396,14 +394,12 @@ def call_tool(name, args):
             cmd += ['--slots'] + [str(s) for s in slots]
         else:
             cmd += ['--start', start_date, '--end', end_date]
-        if args.get('extract', False):
-            cmd.append('--extract')
 
         result = subprocess.run(cmd, capture_output=True, text=True, cwd=SCRIPTS_DIR)
         if result.returncode != 0:
             raise RuntimeError(f'Interview slot scoring failed: {result.stderr}')
 
-        # Step 5: return stdout + slot_scores.json if present
+        # Step 6: return stdout + slot_scores.json if present
         output     = result.stdout
         slots_file = os.path.join(SCRIPTS_DIR, 'slot_scores.json')
         if os.path.exists(slots_file):

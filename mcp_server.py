@@ -5,9 +5,10 @@ JHora MCP server — stdio JSON-RPC 2.0 (Model Context Protocol)
 
 import json, os, re, subprocess, sys
 
-SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
-EXTRACT_SH  = os.path.join(SCRIPTS_DIR, 'jhora_extract.sh')
-OUT_DIR     = os.path.join(SCRIPTS_DIR, 'jhora_data')
+SCRIPTS_DIR  = os.path.dirname(os.path.abspath(__file__))
+EXTRACT_SH   = os.path.join(SCRIPTS_DIR, 'jhora_extract.sh')
+INTERVIEW_PY = os.path.join(SCRIPTS_DIR, 'interview_slots.py')
+OUT_DIR      = os.path.join(SCRIPTS_DIR, 'jhora_data')
 
 def _latest_run_dir(name):
     safe     = re.sub(r'[^\w\-]', '_', name)
@@ -203,6 +204,45 @@ TOOLS = [
         }
     },
     {
+        'name': 'interview_advisor',
+        'description': (
+            'Interactive Vedic astrology interview slot advisor. '
+            'Accepts birth details (or an existing chart name), interview slot details '
+            '(fixed slots or date range), interview location details (virtual or onsite), '
+            'and returns the best slots with full classical analysis. '
+            'Use this when the user wants to find or evaluate interview slots and has '
+            'not yet provided all required parameters. '
+            'Required inputs: natal_chart OR (name + date + time + lat + lon + tz + place for birth), '
+            'interview_mode (virtual/onsite), location_lat, location_lon, location_tz, location_place, '
+            'and either slots (list of "YYYY-MM-DD HH:MM" strings) or start_date + end_date. '
+            'If natal_chart is provided as an already-extracted chart name, skip birth extraction. '
+            'If birth details are provided instead, extract the chart first then score slots.'
+        ),
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'natal_chart':    {'type': 'string', 'description': 'Name of already-extracted natal chart (e.g. Supriya_rect_917). If provided, skips birth extraction.'},
+                'birth_name':     {'type': 'string', 'description': 'Name for the chart if extracting fresh from birth details'},
+                'birth_date':     {'type': 'string', 'description': 'Birth date YYYY-MM-DD'},
+                'birth_time':     {'type': 'string', 'description': 'Birth time HH:MM'},
+                'birth_lat':      {'type': 'number', 'description': 'Birth place latitude'},
+                'birth_lon':      {'type': 'number', 'description': 'Birth place longitude'},
+                'birth_tz':       {'type': 'number', 'description': 'Birth timezone offset e.g. 5.5 for IST'},
+                'birth_place':    {'type': 'string', 'description': 'Birth place name'},
+                'interview_mode': {'type': 'string', 'enum': ['virtual', 'onsite'], 'description': 'Virtual or onsite interview'},
+                'location_lat':   {'type': 'number', 'description': 'Interview/current location latitude'},
+                'location_lon':   {'type': 'number', 'description': 'Interview/current location longitude'},
+                'location_tz':    {'type': 'number', 'description': 'Interview/current location timezone offset'},
+                'location_place': {'type': 'string', 'description': 'Interview/current location name'},
+                'slots':          {'type': 'array', 'items': {'type': 'string'}, 'description': 'Fixed slots as list of "YYYY-MM-DD HH:MM" strings'},
+                'start_date':     {'type': 'string', 'description': 'Start date YYYY-MM-DD for open range mode'},
+                'end_date':       {'type': 'string', 'description': 'End date YYYY-MM-DD for open range mode'},
+                'extract':        {'type': 'boolean', 'description': 'Force fresh JHora extraction for slot charts', 'default': False}
+            },
+            'required': []
+        }
+    },
+    {
         'name': 'get_best_slots',
         'description': (
             'Find the best interview slots in a date range using interview_slots.py. '
@@ -283,8 +323,96 @@ def call_tool(name, args):
         if err: raise RuntimeError(f'Extraction failed: {err}')
         return _load_format(run_dir, 'core')
 
+    if name == 'interview_advisor':
+        # Step 1: resolve natal chart
+        natal_name  = None
+        natal_chart = str(args.get('natal_chart', '')).strip()
+        if natal_chart and _latest_run_dir(natal_chart):
+            natal_name = natal_chart
+        if natal_name is None:
+            birth_fields = ['birth_name', 'birth_date', 'birth_time', 'birth_lat', 'birth_lon', 'birth_tz']
+            if all(str(args.get(f, '')).strip() for f in birth_fields):
+                params = {
+                    'name':  str(args['birth_name']),
+                    'date':  str(args['birth_date']),
+                    'time':  str(args['birth_time']),
+                    'lat':   str(args['birth_lat']),
+                    'lon':   str(args['birth_lon']),
+                    'tz':    str(args['birth_tz']),
+                    'place': str(args.get('birth_place', '')),
+                }
+                run_dir, err = _run_extraction(params)
+                if err:
+                    raise RuntimeError(f'Birth chart extraction failed: {err}')
+                natal_name = str(args['birth_name'])
+            else:
+                return (
+                    'To score interview slots I need your natal chart. Please provide either:\n'
+                    '  • natal_chart — name of an already-extracted chart (e.g. "Supriya_rect_917"), or\n'
+                    '  • Full birth details: birth_name, birth_date (YYYY-MM-DD), birth_time (HH:MM), '
+                    'birth_lat, birth_lon, birth_tz, and optionally birth_place.'
+                )
+
+        # Step 2: resolve slot mode
+        slots      = args.get('slots')
+        start_date = str(args.get('start_date', '')).strip()
+        end_date   = str(args.get('end_date', '')).strip()
+        if slots and isinstance(slots, list) and len(slots) > 0:
+            slot_mode = 'fixed'
+        elif start_date and end_date:
+            slot_mode = 'range'
+        else:
+            return (
+                'Please provide the slots to evaluate. Either:\n'
+                '  • slots — a list of "YYYY-MM-DD HH:MM" strings for fixed slots, or\n'
+                '  • start_date and end_date (YYYY-MM-DD) to search an open date range.'
+            )
+
+        # Step 3: resolve location
+        loc_lat   = args.get('location_lat')
+        loc_lon   = args.get('location_lon')
+        loc_tz    = args.get('location_tz')
+        loc_place = str(args.get('location_place', '')).strip()
+        if loc_lat is None or loc_lon is None or loc_tz is None or not loc_place:
+            return (
+                'Please provide the interview location details:\n'
+                '  • location_lat, location_lon, location_tz (decimal hours east), location_place\n'
+                '  • interview_mode: "virtual" or "onsite" (default: virtual)'
+            )
+
+        mode = args.get('interview_mode', 'virtual')
+
+        # Step 4: build and run subprocess
+        cmd = [
+            'python3', INTERVIEW_PY,
+            '--natal', natal_name,
+            '--lat',   str(loc_lat),
+            '--lon',   str(loc_lon),
+            '--tz',    str(loc_tz),
+            '--place', loc_place,
+            '--mode',  mode,
+        ]
+        if slot_mode == 'fixed':
+            cmd += ['--slots'] + [str(s) for s in slots]
+        else:
+            cmd += ['--start', start_date, '--end', end_date]
+        if args.get('extract', False):
+            cmd.append('--extract')
+
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=SCRIPTS_DIR)
+        if result.returncode != 0:
+            raise RuntimeError(f'Interview slot scoring failed: {result.stderr}')
+
+        # Step 5: return stdout + slot_scores.json if present
+        output     = result.stdout
+        slots_file = os.path.join(SCRIPTS_DIR, 'slot_scores.json')
+        if os.path.exists(slots_file):
+            with open(slots_file) as f:
+                scores = json.load(f)
+            return output + '\n' + json.dumps(scores, indent=2)
+        return output
+
     if name == 'get_best_slots':
-        INTERVIEW_PY = os.path.join(SCRIPTS_DIR, 'interview_slots.py')
         cmd = [
             'python3', INTERVIEW_PY,
             '--natal', str(args['natal']),
